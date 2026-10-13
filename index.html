@@ -83,9 +83,15 @@ input:focus,select:focus { border-color:var(--cyan); }
 .mode-btn.active { background:#123343;border-color:#0e7490;color:var(--cyan); }
 .clock { font-size:clamp(42px,6vw,57px);font-weight:750;text-align:center;font-variant-numeric:tabular-nums;margin:12px 0 3px; }
 .timer-caption { text-align:center;color:var(--muted);font-size:12px; }
+.timer-cycle-progress { text-align:center;color:var(--cyan);font-size:12px;margin-top:9px;font-variant-numeric:tabular-nums; }
+.timer-modes .mode-btn { display:block;text-align:center;user-select:none;cursor:default; }
+.timer-modes .mode-btn.active { background:#123343;border-color:#0e7490;color:var(--cyan); }
 .timer-actions { display:flex;gap:8px;margin-top:19px; }
 .timer-actions button { flex:1; }
 .timer-tip { font-size:11px;color:var(--muted);text-align:center;margin-top:13px;line-height:1.8; }
+.alert-settings { display:grid;gap:7px;margin-top:12px; }
+.alert-settings button { width:100%;font-size:12px;padding:9px 10px; }
+.alert-permission-status { color:var(--muted);font-size:10px;text-align:center;line-height:1.6; }
 .subject-summary { padding:15px 19px; }
 .subject-row { display:flex;justify-content:space-between;gap:8px;font-size:12px;margin:13px 0 7px;color:#c5d5e8; }
 .subject-bar { height:6px;background:#223149;border-radius:20px;overflow:hidden; }
@@ -231,18 +237,23 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
         <div class="timer-heading">
           <h3>◉ 番茄專注鐘</h3><span class="live" id="timerStatus">準備中</span>
         </div>
-        <div class="timer-modes">
-          <button class="mode-btn active" data-mode="focus">專注 25 分</button>
-          <button class="mode-btn" data-mode="short">短休息 5 分</button>
-          <button class="mode-btn" data-mode="long">長休息 15 分</button>
+        <div class="timer-modes" aria-label="番茄鐘循環階段">
+          <span class="mode-btn active" data-phase="focus">專注 25 分</span>
+          <span class="mode-btn" data-phase="short">短休息 5 分</span>
+          <span class="mode-btn" data-phase="long">長休息 15 分</span>
         </div>
         <div class="clock" id="clock">25:00</div>
         <div class="timer-caption" id="timerCaption">專注時間</div>
+        <div class="timer-cycle-progress" id="pomodoroProgress" aria-live="polite">本輪已完成 0 / 4 次專注</div>
         <div class="timer-actions">
           <button class="primary" id="startPauseBtn">開始專注</button>
           <button class="secondary" id="resetTimerBtn">重設</button>
         </div>
-        <div class="timer-tip">番茄鐘只負責倒數與休息提醒。<br>任務讀書時間請在各任務卡片獨立開始或暫停，兩者互不影響。</div>
+        <div class="timer-tip">自動循環：專注 25 分鐘 → 休息 5 分鐘；完成 4 次專注後休息 15 分鐘。<br>番茄鐘只負責倒數與休息提醒；任務計時器仍獨立運作，彼此互不影響。</div>
+        <div class="alert-settings">
+          <button type="button" class="secondary" id="enableAlertsBtn">啟用提示音</button>
+          <div class="alert-permission-status" id="alertPermissionStatus" aria-live="polite">尚未啟用提示音；請先點擊「啟用提示音」，確認瀏覽器可以播放音效。</div>
+        </div>
       </section>
 
       <section class="panel">
@@ -303,6 +314,7 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
   const STORAGE_KEY = "studyQuest.v1";
   const MODE_SECONDS = { focus: 25 * 60, short: 5 * 60, long: 15 * 60 };
   const MODE_LABELS = { focus: "專注時間", short: "短休息時間", long: "長休息時間" };
+  const POMODOROS_PER_LONG_BREAK = 4;
   const $ = id => document.getElementById(id);
 
   let state = loadState();
@@ -310,6 +322,8 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
   let timerInterval = null;
   let timerEndAt = null;
   let noticeTimeout = null;
+  let alertAudioContext = null;
+  let alertAudioReady = false;
 
   function makeId() {
     return Date.now() + "-" + Math.random().toString(16).slice(2);
@@ -345,14 +359,26 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
           timerMode: mode,
           timerRemaining: Math.max(
             0,
-            Math.min(MODE_SECONDS[mode], Number(saved.timerRemaining) || MODE_SECONDS[mode])
+            Math.min(
+              MODE_SECONDS[mode],
+              Number.isFinite(Number(saved.timerRemaining)) ? Number(saved.timerRemaining) : MODE_SECONDS[mode]
+            )
+          ),
+          pomodoroCount: Math.max(
+            0,
+            Math.min(POMODOROS_PER_LONG_BREAK, Math.floor(Number(saved.pomodoroCount) || 0))
           )
         };
       }
     } catch (e) {
       console.warn("讀取儲存資料失敗", e);
     }
-    return { tasks: [], timerMode: "focus", timerRemaining: MODE_SECONDS.focus };
+    return {
+      tasks: [],
+      timerMode: "focus",
+      timerRemaining: MODE_SECONDS.focus,
+      pomodoroCount: 0
+    };
   }
 
   function saveState() {
@@ -376,6 +402,89 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
     clearTimeout(noticeTimeout);
     noticeTimeout = setTimeout(() => $("notice").classList.remove("show"), 2400);
   }
+
+  // 使用 Web Audio API 產生提示音，不需要額外音檔。
+  // 瀏覽器通常要求先經過使用者操作，才能啟用音訊播放。
+  function prepareAlertAudio() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return false;
+
+    try {
+      if (!alertAudioContext || alertAudioContext.state === "closed") {
+        alertAudioContext = new AudioContextClass();
+      }
+      if (alertAudioContext.state === "suspended") {
+        alertAudioContext.resume().catch(() => {});
+      }
+      alertAudioReady = true;
+      return true;
+    } catch (error) {
+      console.warn("無法啟用提示音", error);
+      return false;
+    }
+  }
+
+  function playAlertSound() {
+    if (!prepareAlertAudio() || !alertAudioContext) return;
+
+    const context = alertAudioContext;
+    const playSequence = () => {
+      if (context.state !== "running") return;
+      const startAt = context.currentTime;
+      // 四個短音形成容易辨識的提醒聲。
+      [880, 1046.5, 880, 1318.5].forEach((frequency, index) => {
+        const start = startAt + index * 0.18;
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(frequency, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.16, start + 0.025);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.15);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(start);
+        oscillator.stop(start + 0.16);
+      });
+    };
+
+    if (context.state === "suspended") {
+      context.resume().then(playSequence).catch(() => {});
+    } else {
+      playSequence();
+    }
+  }
+
+  // 時間到時只播放提示音，不使用作業系統通知。
+  function announceTimeUp() {
+    playAlertSound();
+  }
+
+  function renderAlertPermissionStatus() {
+    const status = $("alertPermissionStatus");
+    if (!status) return;
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      status.textContent = "此瀏覽器不支援 Web Audio API，無法播放提示音。";
+    } else if (alertAudioReady) {
+      status.textContent = "✓ 提示音已啟用；讀書任務或番茄鐘時間到時會播放提示音。";
+    } else {
+      status.textContent = "尚未啟用提示音；請點擊上方按鈕並允許瀏覽器播放音效。";
+    }
+  }
+
+  $("enableAlertsBtn").addEventListener("click", () => {
+    const ready = prepareAlertAudio();
+    if (ready) {
+      playAlertSound(); // 播放一次測試音，讓使用者確認設定成功。
+      renderAlertPermissionStatus();
+      showNotice("提示音已啟用，已播放測試音。時間到時會再次提醒。");
+    } else {
+      renderAlertPermissionStatus();
+      showNotice("無法啟用提示音，請確認瀏覽器支援音效播放。");
+    }
+  });
 
   function formatMinutes(minutes) {
     const h = Math.floor(minutes / 60);
@@ -670,15 +779,23 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
 
     task.done = e.target.checked;
 
-    // 任務標記完成時停止其計時，但保留已累積的時間。
-    if (task.done && task.startedAt !== null) {
-      task.elapsedMs = getElapsedMs(task);
+    if (task.done) {
+      // 勾選完成時停止計時，保留當下已累積的讀書時間。
+      if (task.startedAt !== null && task.startedAt !== undefined) {
+        task.elapsedMs = getElapsedMs(task);
+        task.startedAt = null;
+      }
+    } else {
+      // 取消勾選時，將此任務的累積時間歸零並停止計時。
+      task.elapsedMs = 0;
       task.startedAt = null;
     }
 
     saveState();
     renderAll();
-    showNotice(task.done ? "任務完成！做得好。" : "已恢復為待完成任務。");
+    showNotice(task.done
+      ? "任務完成！做得好。"
+      : "已恢復為待完成任務，計時已重設。");
   });
 
   $("taskList").addEventListener("click", e => {
@@ -708,6 +825,7 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
 
     // 新增：開始或繼續任務累積計時。
     if (action === "start-task") {
+      prepareAlertAudio();
       if (task.done) {
         showNotice("請先取消任務完成狀態，再開始計時。");
         return;
@@ -749,7 +867,7 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
   $("subjectFilter").addEventListener("change", renderTasks);
   $("dateFilter").addEventListener("change", renderTasks);
 
-  // 番茄鐘：保留原本的操作方式與設定。
+  // 番茄鐘：專注與休息依固定循環自動切換，與任務計時器完全獨立。
   function renderTimer() {
     const mode = state.timerMode;
     const remain = Math.max(0, state.timerRemaining);
@@ -759,17 +877,21 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
       `${String(remain % 60).padStart(2, "0")}`;
 
     $("timerCaption").textContent = MODE_LABELS[mode];
-    document.querySelectorAll(".mode-btn").forEach(button => {
-      button.classList.toggle("active", button.dataset.mode === mode);
+    document.querySelectorAll("[data-phase]").forEach(element => {
+      const isActive = element.dataset.phase === mode;
+      element.classList.toggle("active", isActive);
+      if (isActive) element.setAttribute("aria-current", "step");
+      else element.removeAttribute("aria-current");
     });
 
+    $("pomodoroProgress").textContent =
+      `本輪已完成 ${state.pomodoroCount} / ${POMODOROS_PER_LONG_BREAK} 次專注`;
+
     $("timerStatus").textContent =
-      timerInterval ? "進行中" : remain === 0 ? "已結束" : "準備中";
+      timerInterval ? "進行中" : "已暫停";
 
     const startLabel = mode === "focus" ? "開始專注" : "開始休息";
-    const restartLabel = mode === "focus" ? "重新開始" : "重新開始休息";
-    $("startPauseBtn").textContent =
-      timerInterval ? "暫停計時" : remain === 0 ? restartLabel : startLabel;
+    $("startPauseBtn").textContent = timerInterval ? "暫停計時" : startLabel;
   }
 
   function stopTimer() {
@@ -778,13 +900,53 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
     timerEndAt = null;
   }
 
+  // 一個階段結束後自動切換並開始下一階段：
+  // 專注 -> 短休息（前 3 次）；第 4 次專注 -> 長休息；休息後回到專注。
+  function advancePomodoroPhase() {
+    const completedMode = state.timerMode;
+    let notificationMessage = "時間到。";
+
+    if (completedMode === "focus") {
+      state.pomodoroCount = Math.min(
+        POMODOROS_PER_LONG_BREAK,
+        state.pomodoroCount + 1
+      );
+      state.timerMode = state.pomodoroCount >= POMODOROS_PER_LONG_BREAK
+        ? "long"
+        : "short";
+      state.timerRemaining = MODE_SECONDS[state.timerMode];
+
+      notificationMessage = state.timerMode === "long"
+        ? "已完成 4 次專注！開始 15 分鐘長休息。"
+        : `第 ${state.pomodoroCount} 次專注完成！開始 5 分鐘短休息。`;
+    } else if (completedMode === "short") {
+      state.timerMode = "focus";
+      state.timerRemaining = MODE_SECONDS.focus;
+      notificationMessage = "短休息結束！開始下一個 25 分鐘專注。";
+    } else {
+      // 長休息結束，重新開始新一輪四次專注。
+      state.pomodoroCount = 0;
+      state.timerMode = "focus";
+      state.timerRemaining = MODE_SECONDS.focus;
+      notificationMessage = "長休息結束！新一輪番茄鐘開始。";
+    }
+
+    showNotice(notificationMessage);
+    announceTimeUp();
+    saveState();
+    renderTimer();
+    startTimer();
+  }
+
   function startTimer() {
+    prepareAlertAudio();
+    if (timerInterval) return;
     if (state.timerRemaining <= 0) {
       state.timerRemaining = MODE_SECONDS[state.timerMode];
     }
-    if (timerInterval) return;
 
     timerEndAt = Date.now() + state.timerRemaining * 1000;
+    document.title = `${MODE_LABELS[state.timerMode]}｜Study Quest`;
 
     timerInterval = setInterval(() => {
       state.timerRemaining = Math.max(
@@ -795,9 +957,7 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
         stopTimer();
         state.timerRemaining = 0;
         saveState();
-        renderTimer();
-        showNotice(`${MODE_LABELS[state.timerMode]}結束！記得休息一下。`);
-        document.title = "時間到！｜Study Quest";
+        advancePomodoroPhase();
         return;
       }
 
@@ -815,29 +975,22 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
       stopTimer();
       saveState();
       renderTimer();
-      showNotice("計時已暫停。");
-    } else {
       document.title = "Study Quest｜讀書任務管理器";
+      showNotice("番茄鐘已暫停。");
+    } else {
       startTimer();
     }
   });
 
   $("resetTimerBtn").addEventListener("click", () => {
     stopTimer();
-    state.timerRemaining = MODE_SECONDS[state.timerMode];
+    state.timerMode = "focus";
+    state.timerRemaining = MODE_SECONDS.focus;
+    state.pomodoroCount = 0;
     saveState();
     renderTimer();
-    showNotice("計時器已重設。");
-  });
-
-  document.querySelectorAll(".mode-btn").forEach(button => {
-    button.addEventListener("click", () => {
-      stopTimer();
-      state.timerMode = button.dataset.mode;
-      state.timerRemaining = MODE_SECONDS[state.timerMode];
-      saveState();
-      renderTimer();
-    });
+    document.title = "Study Quest｜讀書任務管理器";
+    showNotice("番茄鐘已重設，從第 1 次專注重新開始。");
   });
 
   // 新增：每秒更新任務計時器顯示，不重新建立任務 DOM。
@@ -874,11 +1027,14 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
      saveState();
      renderAll();
 
+     let completionMessage;
      if (completedTasks.length === 1) {
-       showNotice(`「${completedTasks[0].name}」時間到！任務已完成。`);
+       completionMessage = `「${completedTasks[0].name}」已達預計讀書時間，任務已完成。`;
      } else {
-       showNotice(`${completedTasks.length} 項任務時間到，已標記完成。`);
+       completionMessage = `${completedTasks.length} 項任務已達預計讀書時間，並已標記完成。`;
      }
+     showNotice(completionMessage);
+     announceTimeUp();
 
      return;
    }
@@ -937,6 +1093,7 @@ footer { text-align:center;color:#60738d;font-size:11px;margin-top:24px; }
   // 初始化原本功能與新增計時器。
   updateTodayLabel();
   renderAll();
+  renderAlertPermissionStatus();
 
   // 每秒更新時間顯示。實際時間由時間戳計算，不依賴 interval 精準度。
   setInterval(() => {
